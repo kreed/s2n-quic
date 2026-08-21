@@ -1,0 +1,287 @@
+# Posts a Slack message when there is activity on a PR that has (or had) a
+# review requested from TEAM_SLUG. The first notification for a PR starts a
+# channel message; later activity on the same PR replies in its thread.
+#
+# Event sources
+# -------------
+# pull_request_target and issue_comment run in the base repository's context
+# and can reach secrets even for fork PRs, so they post directly. Review
+# activity cannot (see slack_pr_notifications_collect.yml) and arrives via
+# workflow_run from that collector. Both paths normalize into the same
+# event.json shape, so everything downstream is source-agnostic.
+#
+# Secrets (Slack app needs the chat:write scope only -- reading scopes such as
+# channels:history would disqualify it from OPUS low-risk auto-approval)
+#   - SLACK_BOT_TOKEN: bot token for the app, invited to the channel
+#   - SLACK_CHANNEL_ID: target channel ID
+#
+# Threading state is a tiny slack-thread-<pr> artifact holding the parent
+# message's ts. Artifacts are repo-scoped (readable from any run, unlike the
+# branch-scoped Actions cache) and don't compete with the CI cache LRU pool.
+# When a PR's artifact has expired (90 days), the next activity starts a fresh
+# parent, which is desirable for channel visibility on long-quiet PRs anyway.
+#
+# Untrusted input: PR titles and comment bodies are attacker-controlled on a
+# public repo, and on the workflow_run path event.json itself is produced by an
+# unprivileged run. Nothing here checks out or executes PR code, all such text
+# reaches Slack as jq-quoted JSON strings rather than shell interpolation, and
+# team relevance is re-verified here with this run's own trusted token.
+name: slack-pr-notifications
+
+on:
+  pull_request_target:
+    types: [review_requested, closed]
+  issue_comment:
+    types: [created]
+  workflow_run:
+    workflows: [slack-pr-notifications-collect]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  actions: read
+
+env:
+  TEAM_SLUG: scs-dev
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    # pull_request_target runs appear in the PR's checks list; never let a
+    # notification hiccup read as failing CI. Failures still show on the run
+    # page in the Actions tab, but the practical alarm is silence in Slack.
+    continue-on-error: true
+    # Direct events: PR comments only (issues share issue_comment), and no bot
+    # chatter -- except a bot merge, which is worth announcing. Collector events
+    # were already filtered upstream, so only their conclusion matters here.
+    if: >
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name != 'workflow_run' &&
+       (github.event_name != 'issue_comment' || github.event.issue.pull_request) &&
+       (github.event.sender.type != 'Bot' ||
+        (github.event.action == 'closed' && github.event.pull_request.merged)))
+    steps:
+      - name: Gather event facts
+        id: facts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          PR_TITLE: ${{ github.event.pull_request.title || github.event.issue.title }}
+          PR_URL: ${{ github.event.pull_request.html_url || github.event.issue.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login || github.event.issue.user.login }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          REQUESTED_TEAM: ${{ github.event.requested_team.slug }}
+          ACTOR: ${{ github.event.sender.login }}
+          LINK: ${{ github.event.comment.html_url }}
+          BODY: ${{ github.event.comment.body }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            # Fetch the collector's normalized payload. A skipped or
+            # artifact-less collector run is not an error, just nothing to do.
+            artifact_id=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts" \
+              --jq '[.artifacts[] | select(.name == "pr-event")] | first | .id // empty')
+            if [ -z "$artifact_id" ]; then
+              echo "no pr-event artifact on run ${RUN_ID}; nothing to notify"
+              echo "found=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            gh api "repos/${{ github.repository }}/actions/artifacts/${artifact_id}/zip" > payload.zip
+            unzip -p payload.zip event.json > event.json.tmp
+            mv event.json.tmp event.json
+          else
+            case "$EVENT_NAME/$ACTION" in
+              pull_request_target/review_requested) kind=review_requested ;;
+              pull_request_target/closed)           kind=closed ;;
+              issue_comment/created)                kind=comment ;;
+              *) echo "::error::unhandled event $EVENT_NAME/$ACTION"; exit 1 ;;
+            esac
+            jq -n \
+              --arg kind "$kind" \
+              --arg pr "$PR_NUMBER" \
+              --arg title "$PR_TITLE" \
+              --arg url "$PR_URL" \
+              --arg author "$PR_AUTHOR" \
+              --arg actor "$ACTOR" \
+              --arg merged "$PR_MERGED" \
+              --arg team "$REQUESTED_TEAM" \
+              --arg link "$LINK" \
+              --arg body "$BODY" \
+              '
+              def esc: gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;");
+              def snip: gsub("\\s+"; " ") | .[0:200] | esc;
+              {
+                kind: $kind,
+                pr: ($pr | tonumber),
+                title: ($title | esc),
+                url: $url,
+                author: $author,
+                actor: $actor,
+                merged: ($merged == "true"),
+                team: $team,
+                state: "",
+                link: (if $link == "" then $url else $link end),
+                snippet: ($body | snip),
+              }' > event.json
+          fi
+          echo "pr=$(jq -r '.pr' event.json)" >> "$GITHUB_OUTPUT"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      # Runs before the relevance check: an existing thread artifact proves the
+      # team was already notified about this PR, which answers both questions
+      # and skips the paginated timeline walk on the steady-state hot path.
+      - name: Look up this PR's Slack thread
+        id: thread
+        if: steps.facts.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.facts.outputs.pr }}
+        run: |
+          # Oldest live artifact wins, so a duplicate parent (two events racing
+          # the read-then-write below) still leaves every later event threading
+          # onto one consistent parent instead of splitting the conversation.
+          artifact_id=$(gh api \
+            "repos/${{ github.repository }}/actions/artifacts?name=slack-thread-${PR}&per_page=100" \
+            --jq '[.artifacts[] | select(.expired | not)] | sort_by(.created_at) | first | .id // empty')
+          thread_ts=""
+          if [ -n "$artifact_id" ]; then
+            # A listed artifact can still be unreadable (GitHub's expired flag
+            # lags actual deletion); fall back to starting a fresh parent.
+            if gh api "repos/${{ github.repository }}/actions/artifacts/${artifact_id}/zip" > thread.zip \
+               && unzip -p thread.zip thread_ts > ts.txt; then
+              thread_ts=$(cat ts.txt)
+            else
+              echo "artifact ${artifact_id} unreadable; starting a new thread"
+            fi
+          fi
+          echo "thread_ts=$thread_ts" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the team was requested on this PR
+        id: team_check
+        if: steps.facts.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.facts.outputs.pr }}
+          THREAD_TS: ${{ steps.thread.outputs.thread_ts }}
+        run: |
+          kind=$(jq -r '.kind' event.json)
+          if [ "$kind" = "review_requested" ]; then
+            # Fires once per requested reviewer; only the team request matters.
+            [ "$(jq -r '.team' event.json)" = "$TEAM_SLUG" ] && relevant=true || relevant=false
+          elif [ -n "$THREAD_TS" ]; then
+            relevant=true
+          else
+            # The team may already have been dropped from requested_reviewers
+            # (GitHub removes it once a member reviews), so consult the
+            # timeline. Capture gh's status separately from the grep: piping
+            # straight into grep would mask an API failure as "not relevant".
+            if ! teams=$(gh api "repos/${{ github.repository }}/issues/${PR}/timeline" --paginate \
+                --jq '.[] | select(.event == "review_requested") | .requested_team.slug // empty'); then
+              echo "::error::could not read the timeline for PR ${PR}"
+              exit 1
+            fi
+            printf '%s\n' "$teams" | grep -qxF "$TEAM_SLUG" && relevant=true || relevant=false
+          fi
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+
+      - name: Compose message
+        id: message
+        if: steps.team_check.outputs.relevant == 'true'
+        run: |
+          kind=$(jq -r '.kind' event.json)
+          pr=$(jq -r '.pr' event.json)
+          title=$(jq -r '.title' event.json)
+          url=$(jq -r '.url' event.json)
+          author=$(jq -r '.author' event.json)
+          actor=$(jq -r '.actor' event.json)
+          merged=$(jq -r '.merged' event.json)
+          team=$(jq -r '.team' event.json)
+          state=$(jq -r '.state' event.json)
+          link=$(jq -r '.link' event.json)
+          snippet=$(jq -r '.snippet' event.json)
+
+          case "$kind" in
+            review_requested)
+              line=":eyes: Review requested from ${team} on <${url}|#${pr}: ${title}> (by ${author})"
+              ;;
+            closed)
+              if [ "$merged" = "true" ]; then
+                line=":tada: ${actor} merged <${url}|#${pr}: ${title}>"
+              else
+                line=":no_entry_sign: ${actor} closed <${url}|#${pr}: ${title}>"
+              fi
+              ;;
+            review)
+              case "$state" in
+                approved)          emoji=":white_check_mark:" verb="approved" ;;
+                changes_requested) emoji=":pencil2:"          verb="requested changes on" ;;
+                *)
+                  # Every inline diff comment also fires an implicit review with
+                  # state=commented and no body. The comment itself arrives as a
+                  # review_comment event with its text, so drop the empty
+                  # wrapper rather than posting a content-free line.
+                  if [ -z "$snippet" ]; then
+                    echo "empty implicit review; nothing to post"
+                    echo "skip=true" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
+                  emoji=":speech_balloon:" verb="reviewed"
+                  ;;
+              esac
+              line="${emoji} ${actor} ${verb} <${link}|#${pr}: ${title}>"
+              [ -n "$snippet" ] && line="${line}: ${snippet}"
+              ;;
+            review_comment|comment)
+              line=":speech_balloon: ${actor} commented on <${link}|#${pr}: ${title}>: ${snippet}"
+              ;;
+            *)
+              echo "::error::unhandled kind $kind"
+              exit 1
+              ;;
+          esac
+          {
+            echo "text<<SLACK_EOF"
+            echo "$line"
+            echo "SLACK_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post to Slack
+        id: post
+        if: steps.team_check.outputs.relevant == 'true' && steps.message.outputs.skip != 'true'
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          TEXT: ${{ steps.message.outputs.text }}
+          THREAD_TS: ${{ steps.thread.outputs.thread_ts }}
+        run: |
+          # Reply in the PR's thread if one exists; otherwise start a new parent
+          # message and record its ts for later runs to thread onto.
+          payload=$(jq -n --arg channel "$SLACK_CHANNEL_ID" --arg text "$TEXT" \
+              --arg thread_ts "$THREAD_TS" '
+            {channel: $channel, text: $text}
+            + (if $thread_ts != "" then {thread_ts: $thread_ts} else {} end)')
+
+          # No --fail-with-body: Slack reports most errors as HTTP 200 with
+          # ok:false, and on a real HTTP error it would abort this assignment
+          # and discard the body that explains what went wrong.
+          response=$(curl --silent --show-error \
+            -X POST -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            --data "$payload" "https://slack.com/api/chat.postMessage")
+          echo "$response" | jq -e '.ok' > /dev/null || { echo "$response"; exit 1; }
+
+          if [ -z "$THREAD_TS" ]; then
+            echo "$response" | jq -r '.ts' > thread_ts
+            echo "new_parent=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save thread mapping
+        if: steps.post.outputs.new_parent == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: slack-thread-${{ steps.facts.outputs.pr }}
+          path: thread_ts
