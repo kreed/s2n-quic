@@ -1,0 +1,2 @@
+scratch file for slack notification e2e test
+line two gives the diff something to anchor inline comments on
