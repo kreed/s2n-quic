@@ -1,0 +1,82 @@
+# Stage 1 of the Slack PR notification pipeline.
+#
+# pull_request_review and pull_request_review_comment are unprivileged triggers
+# for pull requests from forks: GitHub withholds repository secrets and hands
+# the run a read-only token. Every PR to this repo comes from a fork, so review
+# activity cannot be posted to Slack from these triggers directly.
+#
+# This workflow therefore holds no secrets and does nothing but normalize the
+# event into event.json and upload it as an artifact. The privileged half,
+# slack_pr_notifications.yml, picks that up via workflow_run and posts it.
+#
+# It never checks out or executes PR code. Note that a fork PR *can* modify
+# this file (that is what "unprivileged" means), so the notifier treats
+# event.json as untrusted input and re-verifies team relevance itself.
+name: slack-pr-notifications-collect
+
+on:
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    # This run appears in the PR's checks list (pull_request_review runs attach
+    # to the PR head SHA); never let a notification hiccup read as failing CI.
+    # Step-level continue-on-error keeps the job -- and hence the check run --
+    # green even when a step fails (job-level continue-on-error would not:
+    # the per-job check run still records failure and renders as a red X).
+    if: github.event.sender.type != 'Bot'
+    steps:
+      - name: Normalize event payload
+        continue-on-error: true
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          ACTOR: ${{ github.event.sender.login }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          LINK: ${{ github.event.review.html_url || github.event.comment.html_url }}
+          BODY: ${{ github.event.review.body || github.event.comment.body }}
+        run: |
+          jq -n \
+            --arg event "$EVENT_NAME" \
+            --arg pr "$PR_NUMBER" \
+            --arg title "$PR_TITLE" \
+            --arg url "$PR_URL" \
+            --arg actor "$ACTOR" \
+            --arg state "$REVIEW_STATE" \
+            --arg link "$LINK" \
+            --arg body "$BODY" \
+            '
+            # Slack mrkdwn requires these three escaped in user-controlled text.
+            def esc: gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;");
+            # Collapse all whitespace (including CR) and truncate on codepoint
+            # boundaries so multibyte characters are never split.
+            def snip: gsub("\\s+"; " ") | .[0:200] | esc;
+            {
+              kind: (if $event == "pull_request_review" then "review" else "review_comment" end),
+              pr: ($pr | tonumber),
+              title: ($title | esc),
+              url: $url,
+              author: "",
+              actor: $actor,
+              merged: false,
+              team: "",
+              state: $state,
+              link: (if $link == "" then $url else $link end),
+              snippet: ($body | snip),
+            }' > event.json
+          cat event.json
+
+      - uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: pr-event
+          path: event.json
