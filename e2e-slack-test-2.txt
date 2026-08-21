@@ -1,0 +1,3 @@
+scratch file two for slack notification e2e test
+second line to anchor inline comments
+third line for good measure
