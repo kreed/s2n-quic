@@ -168,6 +168,12 @@ jobs:
           PR: ${{ steps.facts.outputs.pr }}
           THREAD_TS: ${{ steps.thread.outputs.thread_ts }}
         run: |
+          # E2E TEST SHIM -- DO NOT MERGE: personal forks have no org teams, so
+          # the team gate can never pass there; treat everything as relevant.
+          if [ "${{ github.repository_owner }}" != "aws" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           kind=$(jq -r '.kind' event.json)
           if [ "$kind" = "review_requested" ]; then
             # Fires once per requested reviewer; only the team request matters.
